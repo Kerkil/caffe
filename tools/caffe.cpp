@@ -6,19 +6,27 @@
 #include <vector>
 
 #include "boost/algorithm/string.hpp"
+#include "boost/thread.hpp"
 #include "caffe/caffe.hpp"
+#include "caffe/proto/caffe.pb.h"
 
 using caffe::Blob;
 using caffe::Caffe;
+using caffe::DevicePair;
+using caffe::GPUParams;
 using caffe::Net;
 using caffe::Layer;
+using caffe::Solver;
+using caffe::P2PSync;
 using caffe::shared_ptr;
+using caffe::string;
 using caffe::Timer;
 using caffe::vector;
+using std::ostringstream;
 
-
-DEFINE_int32(gpu, -1,
-    "Run in GPU mode on given device ID.");
+DEFINE_string(gpus, "",
+    "Run in GPU mode on given device IDs separated by ','."
+    "Use 'none' for CPU mode. Runs on all available GPUs by default.");
 DEFINE_string(solver, "",
     "The solver definition protocol buffer text file.");
 DEFINE_string(model, "",
@@ -26,8 +34,8 @@ DEFINE_string(model, "",
 DEFINE_string(snapshot, "",
     "Optional; the snapshot solver state to resume training.");
 DEFINE_string(weights, "",
-    "Optional; the pretrained weights to initialize finetuning. "
-    "Cannot be set simultaneously with snapshot.");
+    "Optional; the pretrained weights to initialize finetuning, "
+    "separated by ','. Cannot be set simultaneously with snapshot.");
 DEFINE_int32(iterations, 50,
     "The number of iterations to run.");
 
@@ -61,6 +69,14 @@ static BrewFunction GetBrewFunction(const caffe::string& name) {
   }
 }
 
+static void parse_gpus(const string& arg, vector<int>* gpus) {
+  vector<string> strings;
+  boost::split(strings, arg, boost::is_any_of(","));
+  for (int i = 0; i < strings.size(); ++i) {
+    gpus->push_back(boost::lexical_cast<int>(strings[i]));
+  }
+}
+
 // caffe commands to call by
 //     caffe <command> <args>
 //
@@ -69,10 +85,13 @@ static BrewFunction GetBrewFunction(const caffe::string& name) {
 
 // Device Query: show diagnostic information for a GPU device.
 int device_query() {
-  CHECK_GT(FLAGS_gpu, -1) << "Need a device ID to query.";
-  LOG(INFO) << "Querying device ID = " << FLAGS_gpu;
-  caffe::Caffe::SetDevice(FLAGS_gpu);
-  caffe::Caffe::DeviceQuery();
+  LOG(INFO) << "Querying GPUs " << FLAGS_gpus;
+  vector<int> gpus;
+  parse_gpus(FLAGS_gpus, &gpus);
+  for (int i = 0; i < gpus.size(); ++i) {
+    caffe::Caffe::SetDevice(gpus[i]);
+    caffe::Caffe::DeviceQuery();
+  }
   return 0;
 }
 RegisterBrewFunction(device_query);
@@ -101,36 +120,96 @@ int train() {
   caffe::SolverParameter solver_param;
   caffe::ReadProtoFromTextFileOrDie(FLAGS_solver, &solver_param);
 
-  // If the gpu flag is not provided, allow the mode and device to be set
+  // If the gpus flag is not provided, allow the mode and device to be set
   // in the solver prototxt.
-  if (FLAGS_gpu < 0
+  if (FLAGS_gpus.size() == 0
       && solver_param.solver_mode() == caffe::SolverParameter_SolverMode_GPU) {
-    FLAGS_gpu = solver_param.device_id();
+    FLAGS_gpus = "" + solver_param.device_id();
   }
 
-  // Set device id and mode
-  if (FLAGS_gpu >= 0) {
-    LOG(INFO) << "Use GPU with device ID " << FLAGS_gpu;
-    Caffe::SetDevice(FLAGS_gpu);
-    Caffe::set_mode(Caffe::GPU);
-  } else {
-    LOG(INFO) << "Use CPU.";
+  vector<DevicePair> pairs;
+  if (FLAGS_gpus == "none") {
+    LOG(INFO) << "Using CPU";
     Caffe::set_mode(Caffe::CPU);
+  } else {
+    vector<int> gpus;
+
+    // Parse GPU ids, or use all available devices by default
+    if (FLAGS_gpus.size()) {
+      parse_gpus(FLAGS_gpus, &gpus);
+    } else {
+      int count = 0;
+      CUDA_CHECK(cudaGetDeviceCount(&count));
+      for (int i = 0; i < count; ++i) {
+        gpus.push_back(i);
+      }
+    }
+    ostringstream s;
+    for (int i = 0; i < gpus.size(); ++i) {
+      s << (i ? ", " : "") << gpus[i];
+    }
+    LOG(INFO) << "Using GPUs " << s.str();
+
+    // Pair devices for map-reduce synchronization
+    DevicePair::compute(gpus, &pairs);
+    s.str("");
+    s << "root:" << pairs[0].device;
+    for (int i = 1; i < pairs.size(); ++i) {
+      s << ", " << pairs[i].parent << ":" << pairs[i].device;
+    }
+    LOG(INFO) << "Pairing GPUs " << s.str();
+
+    solver_param.set_device_id(pairs[0].device);
+    Caffe::SetDevice(pairs[0].device);
+    Caffe::set_mode(Caffe::GPU);
+    Caffe::set_solver_count(gpus.size());
   }
 
-  LOG(INFO) << "Starting Optimization";
-  shared_ptr<caffe::Solver<float> >
-    solver(caffe::GetSolver<float>(solver_param));
+  shared_ptr<Solver<float> > root(caffe::GetSolver<float>(solver_param));
 
   if (FLAGS_snapshot.size()) {
     LOG(INFO) << "Resuming from " << FLAGS_snapshot;
-    solver->Solve(FLAGS_snapshot);
+    root->Restore(FLAGS_snapshot.c_str());
   } else if (FLAGS_weights.size()) {
-    CopyLayers(&*solver, FLAGS_weights);
-    solver->Solve();
-  } else {
-    solver->Solve();
+    CopyLayers(root.get(), FLAGS_weights);
   }
+
+  vector<shared_ptr<P2PSync<float> > > syncs(pairs.size());
+  syncs[0].reset(new P2PSync<float>(root.get(), NULL, solver_param));
+
+  // Build the GPU tree by finding the parent for each solver
+  for (int attempts = 0; attempts < pairs.size(); ++attempts) {
+    for (int i = 1; i < pairs.size(); ++i) {
+      if (!syncs[i].get()) {
+        P2PSync<float>* parent = NULL;
+        for (int j = 0; j < syncs.size(); ++j) {
+          if (syncs[j].get() &&
+              syncs[j]->solver()->param().device_id() == pairs[i].parent) {
+            parent = syncs[j].get();
+          }
+        }
+        if (parent) {
+          solver_param.set_device_id(pairs[i].device);
+          syncs[i].reset(new P2PSync<float>(root.get(), parent, solver_param));
+          parent->add_child(syncs[i]);
+        }
+      }
+    }
+  }
+
+  LOG(INFO) << "Starting Optimization";
+
+  for (int i = 1; i < syncs.size(); ++i) {
+    syncs[i]->StartInternalThread();
+  }
+
+  // Run root solver on current thread
+  root->Solve();
+
+  for (int i = 1; i < syncs.size(); ++i) {
+    syncs[i]->StopInternalThread();
+  }
+
   LOG(INFO) << "Optimization Done.";
   return 0;
 }
@@ -143,9 +222,11 @@ int test() {
   CHECK_GT(FLAGS_weights.size(), 0) << "Need model weights to score.";
 
   // Set device id and mode
-  if (FLAGS_gpu >= 0) {
-    LOG(INFO) << "Use GPU with device ID " << FLAGS_gpu;
-    Caffe::SetDevice(FLAGS_gpu);
+  if (FLAGS_gpus.size() >= 0) {
+    LOG(INFO) << "Use GPU with device ID " << FLAGS_gpus;
+    vector<int> gpus;
+    parse_gpus(FLAGS_gpus, &gpus);
+    Caffe::SetDevice(gpus[0]);
     Caffe::set_mode(Caffe::GPU);
   } else {
     LOG(INFO) << "Use CPU.";
@@ -208,9 +289,11 @@ int time() {
   CHECK_GT(FLAGS_model.size(), 0) << "Need a model definition to time.";
 
   // Set device id and mode
-  if (FLAGS_gpu >= 0) {
-    LOG(INFO) << "Use GPU with device ID " << FLAGS_gpu;
-    Caffe::SetDevice(FLAGS_gpu);
+  if (FLAGS_gpus.size() >= 0) {
+    LOG(INFO) << "Use GPU with device ID " << FLAGS_gpus;
+    vector<int> gpus;
+    parse_gpus(FLAGS_gpus, &gpus);
+    Caffe::SetDevice(gpus[0]);
     Caffe::set_mode(Caffe::GPU);
   } else {
     LOG(INFO) << "Use CPU.";
